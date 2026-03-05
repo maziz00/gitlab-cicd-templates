@@ -1,0 +1,245 @@
+# Example: Monorepo Multi-Service Pipeline
+# GitLab CI/CD | GitLab 16.x+
+# ─────────────────────────────────────────────────────
+#
+# Builds and deploys multiple services from a single repo.
+# Only rebuilds services whose files have changed.
+#
+# Repo structure:
+#   monorepo/
+#   ├── services/
+#   │   ├── api/
+#   │   │   ├── Dockerfile
+#   │   │   └── src/
+#   │   ├── web/
+#   │   │   ├── Dockerfile
+#   │   │   └── src/
+#   │   └── worker/
+#   │       ├── Dockerfile
+#   │       └── src/
+#   ├── shared/          # Shared libs — triggers all services
+#   └── .gitlab-ci.yml
+# ─────────────────────────────────────────────────────
+
+variables:
+  DOCKER_REGISTRY: "registry.gitlab.com"
+  BASE_IMAGE: "$CI_REGISTRY_IMAGE"
+
+default:
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+  timeout: 15 minutes
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - build
+  - test
+  - deploy
+
+# ══════════════════════════════════════════════════════
+# API SERVICE
+# Only runs when services/api/ or shared/ files change
+# ══════════════════════════════════════════════════════
+
+build-api:
+  stage: build
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    SERVICE_NAME: "api"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - |
+      docker build \
+        --cache-from $BASE_IMAGE/$SERVICE_NAME:latest \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -t $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHA \
+        -t $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_REF_SLUG \
+        -f services/$SERVICE_NAME/Dockerfile \
+        .
+    - docker push $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHA
+    - docker push $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_REF_SLUG
+  rules:
+    # Trigger on changes to api service or shared libraries
+    - changes:
+        - services/api/**/*
+        - shared/**/*
+
+test-api:
+  stage: test
+  image: $BASE_IMAGE/api:$CI_COMMIT_SHA
+  script:
+    # Replace with your actual test command
+    - echo "Testing API service..."
+    # - python -m pytest tests/ -v
+  needs: [build-api]
+  rules:
+    - changes:
+        - services/api/**/*
+        - shared/**/*
+
+deploy-api:
+  stage: deploy
+  image: alpine/helm:3.14.0
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "${KUBECONFIG_PRODUCTION}" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+  script:
+    - |
+      helm upgrade --install api ./charts/api \
+        --namespace production \
+        --set image.tag=$CI_COMMIT_SHA \
+        --wait --timeout 5m
+  needs: [test-api]
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - services/api/**/*
+        - shared/**/*
+
+# ══════════════════════════════════════════════════════
+# WEB SERVICE
+# Only runs when services/web/ or shared/ files change
+# ══════════════════════════════════════════════════════
+
+build-web:
+  stage: build
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    SERVICE_NAME: "web"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - |
+      docker build \
+        --cache-from $BASE_IMAGE/$SERVICE_NAME:latest \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -t $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHA \
+        -t $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_REF_SLUG \
+        -f services/$SERVICE_NAME/Dockerfile \
+        .
+    - docker push $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHA
+    - docker push $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_REF_SLUG
+  rules:
+    - changes:
+        - services/web/**/*
+        - shared/**/*
+
+test-web:
+  stage: test
+  image: $BASE_IMAGE/web:$CI_COMMIT_SHA
+  script:
+    - echo "Testing Web service..."
+    # - npm test -- --ci --coverage
+  needs: [build-web]
+  rules:
+    - changes:
+        - services/web/**/*
+        - shared/**/*
+
+deploy-web:
+  stage: deploy
+  image: alpine/helm:3.14.0
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "${KUBECONFIG_PRODUCTION}" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+  script:
+    - |
+      helm upgrade --install web ./charts/web \
+        --namespace production \
+        --set image.tag=$CI_COMMIT_SHA \
+        --wait --timeout 5m
+  needs: [test-web]
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - services/web/**/*
+        - shared/**/*
+
+# ══════════════════════════════════════════════════════
+# WORKER SERVICE
+# Only runs when services/worker/ or shared/ files change
+# ══════════════════════════════════════════════════════
+
+build-worker:
+  stage: build
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    SERVICE_NAME: "worker"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - |
+      docker build \
+        --cache-from $BASE_IMAGE/$SERVICE_NAME:latest \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -t $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHA \
+        -t $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_REF_SLUG \
+        -f services/$SERVICE_NAME/Dockerfile \
+        .
+    - docker push $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHA
+    - docker push $BASE_IMAGE/$SERVICE_NAME:$CI_COMMIT_REF_SLUG
+  rules:
+    - changes:
+        - services/worker/**/*
+        - shared/**/*
+
+test-worker:
+  stage: test
+  image: $BASE_IMAGE/worker:$CI_COMMIT_SHA
+  script:
+    - echo "Testing Worker service..."
+    # - go test ./... -v
+  needs: [build-worker]
+  rules:
+    - changes:
+        - services/worker/**/*
+        - shared/**/*
+
+deploy-worker:
+  stage: deploy
+  image: alpine/helm:3.14.0
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "${KUBECONFIG_PRODUCTION}" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+  script:
+    - |
+      helm upgrade --install worker ./charts/worker \
+        --namespace production \
+        --set image.tag=$CI_COMMIT_SHA \
+        --wait --timeout 5m
+  needs: [test-worker]
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - services/worker/**/*
+        - shared/**/*
+
+# ─────────────────────────────────────────────────────
+# REQUIRED CI/CD VARIABLES:
+# CI_REGISTRY_USER       — Auto-set by GitLab
+# CI_REGISTRY_PASSWORD   — Auto-set by GitLab
+# KUBECONFIG_PRODUCTION  — base64-encoded kubeconfig
+#
+# HOW IT WORKS:
+# - GitLab evaluates `changes:` rules per job
+# - If only services/api/ changed, only api jobs run
+# - If shared/ changed, ALL service jobs run
+# - This saves runner time and avoids unnecessary builds
+# ─────────────────────────────────────────────────────
