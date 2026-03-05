@@ -1,0 +1,186 @@
+# Template 02: Terraform Plan + Apply Pipeline
+# GitLab CI/CD | Production-Grade | GitLab 16.x+
+# Features: MR plan, approval gate, manual apply, state locking
+# From: Mohamed AbdelAziz — DevOps Accelerator
+# ─────────────────────────────────────────────────────────────────
+
+# ── CONFIGURE THESE VARIABLES ──────────────────────────────────────
+variables:
+  # Terraform version — pin this! Don't use 'latest' in production
+  TF_VERSION: "1.7.0"
+  # Path to your Terraform root module (change if not in repo root)
+  TF_ROOT: "${CI_PROJECT_DIR}"
+  # Terraform workspace (maps to environment — e.g., staging, production)
+  TF_WORKSPACE: "default"
+  # Backend config — override per environment using GitLab environments
+  # AWS: TF_BACKEND_BUCKET, TF_BACKEND_KEY, TF_BACKEND_REGION
+  # GCP: TF_BACKEND_BUCKET, TF_BACKEND_PREFIX
+  TF_CLI_ARGS_init: "-backend-config=bucket=${TF_BACKEND_BUCKET} -backend-config=key=${TF_BACKEND_KEY} -backend-config=region=${TF_BACKEND_REGION}"
+
+# ── DEFAULT SETTINGS ────────────────────────────────────────────────
+default:
+  image: hashicorp/terraform:${TF_VERSION}
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+  timeout: 30 minutes
+  # Cache .terraform directory to avoid re-downloading providers on every run
+  cache:
+    key: terraform-${CI_COMMIT_REF_SLUG}
+    paths:
+      - ${TF_ROOT}/.terraform/
+      - ${TF_ROOT}/.terraform.lock.hcl
+
+# ── WORKFLOW RULES ────────────────────────────────────────────────
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ── STAGES ────────────────────────────────────────────────────────
+stages:
+  - validate    # Syntax check + format check
+  - plan        # terraform plan — generates execution plan
+  - apply       # terraform apply — makes real changes (manual trigger)
+  - destroy     # terraform destroy — cleanup (manual, protected branch only)
+
+# ── STAGE 1: VALIDATE ─────────────────────────────────────────────
+tf-validate:
+  stage: validate
+  before_script:
+    - cd ${TF_ROOT}
+    - terraform init -backend=false   # Init without backend for validation
+  script:
+    # Check formatting — fail if code is not properly formatted
+    - |
+      echo "Checking Terraform formatting..."
+      terraform fmt -check -recursive
+      if [ $? -ne 0 ]; then
+        echo "ERROR: Terraform files are not properly formatted."
+        echo "Run 'terraform fmt -recursive' locally and commit the changes."
+        exit 1
+      fi
+    # Validate syntax and configuration
+    - terraform validate
+    - echo "Validation passed!"
+  rules:
+    # Run on every MR and every push
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ── STAGE 2: PLAN ─────────────────────────────────────────────────
+tf-plan:
+  stage: plan
+  before_script:
+    - cd ${TF_ROOT}
+    # Full init with backend for plan/apply stages
+    - terraform init
+    # Select or create workspace
+    - terraform workspace select ${TF_WORKSPACE} || terraform workspace new ${TF_WORKSPACE}
+  script:
+    # Run plan and save output to file (used by apply stage)
+    - terraform plan -out=tfplan -input=false
+    # Show human-readable plan output in pipeline log
+    - terraform show -no-color tfplan | tee plan-output.txt
+    # Create a plan summary for MR comments (optional)
+    - |
+      ADDED=$(grep -c "^  + resource" plan-output.txt || true)
+      CHANGED=$(grep -c "^  ~ resource" plan-output.txt || true)
+      DESTROYED=$(grep -c "^  - resource" plan-output.txt || true)
+      echo "Plan Summary: ${ADDED} to add, ${CHANGED} to change, ${DESTROYED} to destroy"
+  # Save the plan file as an artifact — used by the apply stage
+  artifacts:
+    name: "terraform-plan-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - ${TF_ROOT}/tfplan
+      - ${TF_ROOT}/plan-output.txt
+    # Keep artifacts for 7 days — long enough for review + approval
+    expire_in: 7 days
+    reports:
+      # Surface plan in MR view (GitLab Ultimate feature)
+      # terraform: ${TF_ROOT}/plan-output.txt
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ── STAGE 3: APPLY ────────────────────────────────────────────────
+tf-apply:
+  stage: apply
+  before_script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform workspace select ${TF_WORKSPACE} || terraform workspace new ${TF_WORKSPACE}
+  script:
+    - echo "Applying Terraform plan..."
+    - echo "Commit: ${CI_COMMIT_SHA}"
+    - echo "Branch: ${CI_COMMIT_REF_NAME}"
+    - echo "Triggered by: ${GITLAB_USER_NAME}"
+    # Apply using the saved plan file — guarantees you apply exactly what was reviewed
+    - terraform apply -input=false tfplan
+    - echo "Apply complete!"
+    # Show current state summary
+    - terraform output || true
+  # Require the plan artifact from tf-plan job
+  needs:
+    - job: tf-plan
+      artifacts: true
+  environment:
+    name: ${TF_WORKSPACE}
+  # IMPORTANT: manual trigger requires a human to click "play" in GitLab
+  # This is your approval gate — don't change this to automatic on production
+  when: manual
+  # Allow job to be triggered after pipeline success (not just immediate)
+  allow_failure: false
+  rules:
+    # Only allow apply from the default branch — prevent rogue applies from feature branches
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+    # Block apply on all other contexts
+    - when: never
+
+# ── STAGE 4: DESTROY (Emergency/Cleanup Only) ─────────────────────
+tf-destroy:
+  stage: destroy
+  before_script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform workspace select ${TF_WORKSPACE}
+  script:
+    - echo "WARNING: DESTROYING INFRASTRUCTURE in workspace ${TF_WORKSPACE}"
+    - echo "Triggered by: ${GITLAB_USER_NAME} at $(date)"
+    - terraform destroy -auto-approve -input=false
+  environment:
+    name: ${TF_WORKSPACE}
+  # NEVER auto-run destroy. Always manual.
+  when: manual
+  # Protect this job — only runs from protected branches
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      # Add GitLab protected environment approval if available
+    - when: never
+
+# ── REQUIRED CI/CD VARIABLES ───────────────────────────────────────
+# Set these in GitLab → Settings → CI/CD → Variables
+#
+# For AWS backend:
+# AWS_ACCESS_KEY_ID         — AWS access key (use OIDC in GitLab 15+)
+# AWS_SECRET_ACCESS_KEY     — AWS secret key  
+# AWS_DEFAULT_REGION        — e.g., us-east-1, me-south-1
+# TF_BACKEND_BUCKET         — S3 bucket name for Terraform state
+# TF_BACKEND_KEY            — S3 key for state file (e.g., prod/terraform.tfstate)
+# TF_BACKEND_REGION         — Region for S3 bucket
+#
+# For GCP backend:
+# GOOGLE_CREDENTIALS        — GCP service account JSON key (base64 encoded)
+# TF_BACKEND_BUCKET         — GCS bucket name
+# TF_BACKEND_PREFIX         — GCS prefix (e.g., terraform/prod)
+#
+# For Azure backend:
+# ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_SUBSCRIPTION_ID, ARM_TENANT_ID
+# TF_BACKEND_RESOURCE_GROUP, TF_BACKEND_STORAGE_ACCOUNT, TF_BACKEND_CONTAINER
+#
+# Tip: Use GitLab OIDC (OpenID Connect) with AWS/GCP instead of static keys
+# for better security. See: gitlab-cicd-templates/files/03-oidc-aws-example.yml

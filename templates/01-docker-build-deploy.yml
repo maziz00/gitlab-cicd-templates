@@ -1,0 +1,176 @@
+# Template 01: Docker Build & Deploy Pipeline
+# GitLab CI/CD | Production-Grade | GitLab 16.x+
+# From: Mohamed AbdelAziz — DevOps Accelerator
+# ─────────────────────────────────────────────────────
+
+# ── CONFIGURE THESE VARIABLES ──────────────────────────
+variables:
+  # Docker registry (options: registry.gitlab.com, ECR endpoint, GCR endpoint)
+  DOCKER_REGISTRY: "registry.gitlab.com"
+  # Image name — usually your project path
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE"
+  # Application port for health check
+  APP_PORT: "8080"
+  # Container name for deployment
+  CONTAINER_NAME: "$CI_PROJECT_NAME"
+
+# ── DEFAULT SETTINGS (applied to all jobs) ─────────────
+default:
+  # Retry once on network failures or runner issues
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  # Global timeout — adjust per job if needed
+  timeout: 20 minutes
+  # Use Docker-in-Docker image for builds
+  image: docker:24.0.5
+
+# ── WORKFLOW RULES ─────────────────────────────────────
+# Controls when the entire pipeline runs
+workflow:
+  rules:
+    # Run on merge requests — for testing/preview
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Run on pushes to main/master — for production builds
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # Run on version tags — for release builds
+    - if: $CI_COMMIT_TAG
+
+# ── PIPELINE STAGES ────────────────────────────────────
+stages:
+  - build      # Build Docker image
+  - test       # Run tests inside container
+  - push       # Push to registry
+  - deploy     # Deploy to target environment
+
+# ── DOCKER-IN-DOCKER SERVICE ───────────────────────────
+# Required for building Docker images inside GitLab CI
+services:
+  - docker:24.0.5-dind
+
+# ── STAGE 1: BUILD ─────────────────────────────────────
+build-image:
+  stage: build
+  variables:
+    # Use overlay2 storage driver for better performance
+    DOCKER_DRIVER: overlay2
+    # Disable TLS for DinD (fine for GitLab runners)
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    # Login to GitLab Container Registry
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # Build with cache from the latest image on main branch (speeds up builds)
+    - |
+      docker build \
+        --cache-from $IMAGE_NAME:latest \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        --label "git.commit=$CI_COMMIT_SHA" \
+        --label "git.branch=$CI_COMMIT_REF_NAME" \
+        --label "build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+        -t $IMAGE_NAME:$CI_COMMIT_SHA \
+        -t $IMAGE_NAME:$CI_COMMIT_REF_SLUG \
+        .
+    # Push the SHA-tagged image immediately (used by later stages)
+    - docker push $IMAGE_NAME:$CI_COMMIT_SHA
+    - docker push $IMAGE_NAME:$CI_COMMIT_REF_SLUG
+  # Cache Docker layers between pipeline runs
+  cache:
+    key: docker-cache-$CI_COMMIT_REF_SLUG
+    paths:
+      - .docker-cache/
+  rules:
+    - if: $CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_ID || $CI_COMMIT_TAG
+
+# ── STAGE 2: TEST ──────────────────────────────────────
+test-container:
+  stage: test
+  # Use the image we just built
+  image: $IMAGE_NAME:$CI_COMMIT_SHA
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    # Basic smoke test — verify the container starts and responds
+    # Replace this with your actual test commands
+    - echo "Running smoke tests..."
+    # Example: run your application tests
+    # - python -m pytest tests/ -v
+    # - npm test
+    # - ./gradlew test
+  # Don't block on test failures in MR pipelines (optional — remove to enforce)
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_ID
+
+# ── STAGE 3: PUSH (final tags) ─────────────────────────
+push-latest:
+  stage: push
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # Pull the image we built in the build stage
+    - docker pull $IMAGE_NAME:$CI_COMMIT_SHA
+    # Tag as 'latest' for main branch builds
+    - docker tag $IMAGE_NAME:$CI_COMMIT_SHA $IMAGE_NAME:latest
+    - docker push $IMAGE_NAME:latest
+    # If this is a git tag (release), also tag with version
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag $IMAGE_NAME:$CI_COMMIT_SHA $IMAGE_NAME:$CI_COMMIT_TAG
+        docker push $IMAGE_NAME:$CI_COMMIT_TAG
+        echo "Released version: $CI_COMMIT_TAG"
+      fi
+  # Only push 'latest' on main branch or tags — not on every branch/MR
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ── STAGE 4: DEPLOY ────────────────────────────────────
+# This is a basic SSH deployment example.
+# Replace with your actual deployment method (kubectl, Helm, etc.)
+deploy-production:
+  stage: deploy
+  # Use a minimal image with SSH client
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    # Set up SSH key from CI/CD variable (add SSH_PRIVATE_KEY to GitLab CI variables)
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    # Trust the deployment server's host key
+    - ssh-keyscan $DEPLOY_HOST >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    # SSH to server and pull/run the new image
+    - |
+      ssh $DEPLOY_USER@$DEPLOY_HOST "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        docker pull $IMAGE_NAME:$CI_COMMIT_SHA
+        docker stop $CONTAINER_NAME || true
+        docker rm $CONTAINER_NAME || true
+        docker run -d \
+          --name $CONTAINER_NAME \
+          --restart unless-stopped \
+          -p $APP_PORT:$APP_PORT \
+          $IMAGE_NAME:$CI_COMMIT_SHA
+        echo 'Deployment complete. Container running:'
+        docker ps --filter name=$CONTAINER_NAME
+      "
+  environment:
+    name: production
+    url: https://$DEPLOY_HOST
+  # Only deploy from main branch — require manual trigger for extra safety
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ── REQUIRED CI/CD VARIABLES (set in GitLab → Settings → CI/CD → Variables) ──
+# CI_REGISTRY_USER     — GitLab registry username (auto-set by GitLab)
+# CI_REGISTRY_PASSWORD — GitLab registry password (auto-set by GitLab)
+# SSH_PRIVATE_KEY      — Private SSH key for deployment server
+# DEPLOY_HOST          — IP or hostname of your deployment server
+# DEPLOY_USER          — SSH user on deployment server (e.g., ubuntu, ec2-user)
