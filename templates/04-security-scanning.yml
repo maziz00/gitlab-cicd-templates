@@ -1,0 +1,125 @@
+# Template 04: Security Scanning Pipeline (DevSecOps)
+# GitLab CI/CD | Production-Grade | GitLab 16.x+
+# Includes: SAST, Container Scanning (Trivy), Secret Detection, Dependency Scanning
+# From: Mohamed AbdelAziz — DevOps Accelerator
+# ─────────────────────────────────────────────────────────────────
+
+variables:
+  TRIVY_VERSION: "0.50.0"
+  # Fail build if vulnerabilities at this severity or higher are found
+  TRIVY_SEVERITY: "CRITICAL,HIGH"
+  # Container image to scan (usually built in a previous stage)
+  IMAGE_TO_SCAN: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+  # Allow pipeline to continue even if vulnerabilities found (set to 'false' to block)
+  ALLOW_FAILURE_ON_VULNS: "false"
+
+default:
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+  timeout: 20 minutes
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - security
+
+# ── SAST (Static Application Security Testing) ────────────────────
+# Uses GitLab's built-in SAST (available on all tiers)
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+# ── CONTAINER SCANNING with Trivy ─────────────────────────────────
+trivy-container-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:${TRIVY_VERSION}
+    entrypoint: [""]
+  before_script:
+    - trivy --version
+    # Update vulnerability database
+    - trivy image --download-db-only
+  script:
+    - echo "Scanning image: ${IMAGE_TO_SCAN}"
+    - |
+      trivy image \
+        --exit-code 0 \
+        --format table \
+        --severity ${TRIVY_SEVERITY} \
+        ${IMAGE_TO_SCAN} | tee trivy-report.txt
+    # Fail the job if CRITICAL vulnerabilities found (separate run for exit code)
+    - |
+      trivy image \
+        --exit-code 1 \
+        --severity CRITICAL \
+        --ignore-unfixed \
+        ${IMAGE_TO_SCAN}
+    - echo "Container scan complete. Check trivy-report.txt for details."
+  artifacts:
+    when: always
+    name: "trivy-report-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - trivy-report.txt
+    expire_in: 30 days
+    reports:
+      # Publish to GitLab Security Dashboard (GitLab Ultimate)
+      container_scanning: trivy-report.json
+  allow_failure: $ALLOW_FAILURE_ON_VULNS
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ── FILESYSTEM SCAN (scan the code itself, not just the image) ────
+trivy-filesystem-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:${TRIVY_VERSION}
+    entrypoint: [""]
+  script:
+    - echo "Scanning filesystem for vulnerabilities..."
+    - |
+      trivy fs \
+        --exit-code 0 \
+        --severity ${TRIVY_SEVERITY} \
+        --format table \
+        .
+    - echo "Filesystem scan complete"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ── INFRASTRUCTURE SCAN (Terraform, Kubernetes manifests, Dockerfiles)
+trivy-iac-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:${TRIVY_VERSION}
+    entrypoint: [""]
+  script:
+    - echo "Scanning IaC files for misconfigurations..."
+    - |
+      trivy config \
+        --exit-code 0 \
+        --severity HIGH,CRITICAL \
+        --format table \
+        .
+    - echo "IaC scan complete"
+  artifacts:
+    when: always
+    paths:
+      - trivy-iac-report.txt
+    expire_in: 30 days
+  allow_failure: true  # IaC checks are advisory by default
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# REQUIRED VARIABLES:
+# CI_REGISTRY_USER     — Auto-set by GitLab
+# CI_REGISTRY_PASSWORD — Auto-set by GitLab
+# The image must be pushed before this pipeline runs (use needs: from build stage)

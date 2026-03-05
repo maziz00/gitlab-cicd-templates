@@ -1,0 +1,152 @@
+# Template 03: Kubernetes Helm Deployment Pipeline
+# GitLab CI/CD | Production-Grade | GitLab 16.x+
+# Features: staging→production promotion, rollback, health check
+# From: Mohamed AbdelAziz — DevOps Accelerator
+# ─────────────────────────────────────────────────────────────────
+
+variables:
+  HELM_VERSION: "3.14.0"
+  KUBECTL_VERSION: "1.29.0"
+  # Your Helm chart path inside the repo
+  CHART_PATH: "./charts/app"
+  # Kubernetes namespaces
+  STAGING_NAMESPACE: "staging"
+  PRODUCTION_NAMESPACE: "production"
+  # Helm release names
+  STAGING_RELEASE: "$CI_PROJECT_NAME-staging"
+  PRODUCTION_RELEASE: "$CI_PROJECT_NAME-production"
+  # Container image (built in a separate pipeline or previous stage)
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+
+default:
+  image: alpine/helm:${HELM_VERSION}
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+  timeout: 15 minutes
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - lint       # Validate Helm chart
+  - staging    # Deploy to staging
+  - verify     # Smoke test staging
+  - production # Promote to production
+  - rollback   # Emergency rollback
+
+helm-lint:
+  stage: lint
+  script:
+    - helm lint ${CHART_PATH} --strict
+    - helm template ${CHART_PATH} --debug > /dev/null
+    - echo "Helm chart validation passed"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+deploy-staging:
+  stage: staging
+  before_script:
+    # Setup kubectl — KUBECONFIG_STAGING is base64-encoded kubeconfig
+    - apk add --no-cache curl
+    - curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - mkdir -p ~/.kube
+    - echo "${KUBECONFIG_STAGING}" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+  script:
+    - echo "Deploying ${IMAGE_TAG} to staging..."
+    - |
+      helm upgrade --install ${STAGING_RELEASE} ${CHART_PATH} \
+        --namespace ${STAGING_NAMESPACE} \
+        --create-namespace \
+        --set image.tag=${IMAGE_TAG} \
+        --set environment=staging \
+        --set replicaCount=1 \
+        --wait \
+        --timeout 5m \
+        --history-max 5
+    - echo "Staging deployment complete"
+    - kubectl get pods -n ${STAGING_NAMESPACE}
+  environment:
+    name: staging
+    url: https://staging.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+verify-staging:
+  stage: verify
+  image: curlimages/curl:latest
+  script:
+    # Wait for pods to be ready
+    - sleep 30
+    # Basic HTTP smoke test — replace URL with your staging URL
+    - |
+      RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://staging.example.com/health)
+      if [ "$RESPONSE" != "200" ]; then
+        echo "Health check FAILED! HTTP $RESPONSE"
+        exit 1
+      fi
+      echo "Health check PASSED! HTTP $RESPONSE"
+  needs: [deploy-staging]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy-production:
+  stage: production
+  before_script:
+    - apk add --no-cache curl
+    - curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - mkdir -p ~/.kube
+    - echo "${KUBECONFIG_PRODUCTION}" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+  script:
+    - echo "Promoting ${IMAGE_TAG} to PRODUCTION..."
+    - |
+      helm upgrade --install ${PRODUCTION_RELEASE} ${CHART_PATH} \
+        --namespace ${PRODUCTION_NAMESPACE} \
+        --create-namespace \
+        --set image.tag=${IMAGE_TAG} \
+        --set environment=production \
+        --set replicaCount=3 \
+        --wait \
+        --timeout 10m \
+        --history-max 10
+    - echo "Production deployment COMPLETE"
+    - kubectl get pods -n ${PRODUCTION_NAMESPACE}
+  environment:
+    name: production
+    url: https://production.example.com
+  needs: [verify-staging]
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+rollback-production:
+  stage: rollback
+  before_script:
+    - apk add --no-cache curl
+    - curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - mkdir -p ~/.kube
+    - echo "${KUBECONFIG_PRODUCTION}" | base64 -d > ~/.kube/config
+  script:
+    - echo "EMERGENCY ROLLBACK initiated by ${GITLAB_USER_NAME}"
+    - helm rollback ${PRODUCTION_RELEASE} 0 --namespace ${PRODUCTION_NAMESPACE} --wait
+    - echo "Rollback complete. Current release:"
+    - helm history ${PRODUCTION_RELEASE} --namespace ${PRODUCTION_NAMESPACE} | tail -5
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+# REQUIRED VARIABLES:
+# KUBECONFIG_STAGING    — base64-encoded kubeconfig for staging cluster
+# KUBECONFIG_PRODUCTION — base64-encoded kubeconfig for production cluster
