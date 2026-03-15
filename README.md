@@ -220,7 +220,7 @@ gitlab-cicd-templates/
 
 ---
 
-## Author
+## About Me
 
 **Mohamed AbdelAziz** — Senior DevOps Architect
 12 years building enterprise infrastructure across the UAE, KSA, Sudan and Egypt.
